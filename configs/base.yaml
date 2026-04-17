@@ -1,0 +1,82 @@
+seed: 42
+
+data:
+  root: ./data
+  image_size: 256
+  channels: 3
+  num_workers: 4
+  # List of (weight, path) pairs for mixed-modality sampling. If null, uses `root` as single source.
+  modalities: null
+
+model:
+  in_channels: 3
+  base_filters: 64
+  num_dilated_blocks: 4
+  init_log_sigma: -0.5
+
+action:
+  gamma_range: [0.3, 3.0]
+  alpha_range: [0.5, 2.0]
+  beta_range: [-0.2, 0.2]
+
+reward:
+  # Whether rewards are reduced to a scalar per image (Phase 3) or kept per-pixel (Phase 4).
+  mode: scalar         # {scalar, pixel}
+  # Spatial smoothing kernel radius applied to per-pixel reward maps (Phase 4). 0 disables.
+  pixel_smooth_radius: 2
+  # Relative reward: r_t = R(x_curr) - R(x_prev). Always on.
+  relative: true
+  # Sub-reward weights. Zero to disable.
+  weights:
+    gradient: 1.0
+    entropy: 0.5
+    eme: 0.5
+    clipiqa: 1.0       # 0 if pyiqa not installed; training will warn and skip.
+    musiq: 0.0
+  # Scales applied *before* weighting, to normalize magnitudes across metrics.
+  scales:
+    gradient: 10.0
+    entropy: 1.0
+    eme: 0.1
+    clipiqa: 1.0
+    musiq: 0.01
+
+env:
+  episode_length: 5
+
+train:
+  batch_size: 8
+  lr: 3.0e-4
+  total_updates: 4000           # outer PPO updates; inner rollouts happen every update
+  rollouts_per_update: 1        # one episode per batch before optimizing
+  ppo_epochs: 4
+  minibatch_size: 8             # within each PPO update
+  clip_ratio: 0.2
+  value_coef: 0.5
+  entropy_coef: 0.01
+  entropy_coef_min: 0.001
+  entropy_anneal_steps: 20000
+  gae_gamma: 0.99
+  gae_lambda: 0.95
+  max_grad_norm: 0.5
+  normalize_advantage: true
+  device: cuda
+  algorithm: ppo                # {ppo, grpo}
+
+grpo:
+  group_size: 8
+  beta_kl: 0.0                  # optional KL-to-ref; 0 disables
+  drop_critic: true
+
+log:
+  dir: ./runs
+  run_name: default
+  interval: 20                  # log scalars every N updates
+  image_interval: 500           # log enhanced samples every N updates
+  num_log_images: 4
+  backend: tensorboard          # {tensorboard, none}
+
+checkpoint:
+  dir: null                     # defaults to <log.dir>/<run_name>/checkpoints
+  interval: 500
+  keep_last: 3

@@ -1,0 +1,30 @@
+# Overrides for 6 GB VRAM laptop. Merged on top of base.yaml.
+data:
+  image_size: 128
+  num_workers: 0         # avoid Windows multiprocessing pain
+
+model:
+  base_filters: 32
+
+train:
+  batch_size: 1
+  minibatch_size: 1
+  total_updates: 50
+  device: cuda
+
+reward:
+  weights:
+    gradient: 1.0
+    entropy: 0.5
+    eme: 0.5
+    clipiqa: 0.0         # keep local dev pyiqa-free
+    musiq: 0.0
+
+log:
+  interval: 5
+  image_interval: 10
+  num_log_images: 2
+
+checkpoint:
+  interval: 25
+  keep_last: 1

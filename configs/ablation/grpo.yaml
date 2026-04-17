@@ -1,0 +1,9 @@
+train:
+  algorithm: grpo
+  batch_size: 2
+  minibatch_size: 2
+
+grpo:
+  group_size: 8
+  beta_kl: 0.0
+  drop_critic: true

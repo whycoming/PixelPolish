@@ -1,0 +1,3 @@
+reward:
+  mode: pixel
+  pixel_smooth_radius: 2

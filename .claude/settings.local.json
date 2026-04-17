@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(nvidia-smi)",
+      "Bash(python -m pytest -q)",
+      "Bash(python -m scripts.smoke_forward --config configs/base.yaml --overrides configs/local_dev.yaml)"
+    ]
+  }
+}
