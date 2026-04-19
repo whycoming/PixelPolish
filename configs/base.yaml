@@ -15,31 +15,46 @@ model:
   init_log_sigma: -0.5
 
 action:
-  gamma_range: [0.3, 3.0]
-  alpha_range: [0.5, 2.0]
-  beta_range: [-0.2, 0.2]
+  # Log-symmetric ranges centered at the multiplicative identity (γ=1, α=1).
+  # With log_param=true, raw=0 -> deterministic identity, giving a clean
+  # residual-to-identity initialization (combined with zero-init policy heads).
+  gamma_range: [0.5, 2.0]
+  alpha_range: [0.7071067811865476, 1.4142135623730951]   # 1/√2, √2
+  beta_range: [-0.1, 0.1]
+  gamma_log_param: true
+  alpha_log_param: true
 
 reward:
-  # Whether rewards are reduced to a scalar per image (Phase 3) or kept per-pixel (Phase 4).
-  mode: scalar         # {scalar, pixel}
-  # Spatial smoothing kernel radius applied to per-pixel reward maps (Phase 4). 0 disables.
-  pixel_smooth_radius: 2
-  # Relative reward: r_t = R(x_curr) - R(x_prev). Always on.
-  relative: true
-  # Sub-reward weights. Zero to disable.
+  # `terminal_borda`: reward only at episode end via per-head rank aggregation
+  # over `borda_heads`. The legacy CompositeReward is still constructed (with
+  # the dummy weight below) but is not called during GRPO terminal-borda
+  # rollouts.
+  mode: terminal_borda
+  pixel_smooth_radius: 0
+  relative: false
+  # Dummy non-zero weight so CompositeReward can instantiate; never invoked
+  # in terminal_borda + GRPO mode. Set physics weights to 0 elsewhere.
   weights:
     gradient: 1.0
-    entropy: 0.5
-    eme: 0.5
-    clipiqa: 1.0       # 0 if pyiqa not installed; training will warn and skip.
+    entropy: 0.0
+    eme: 0.0
+    clipiqa: 0.0
     musiq: 0.0
-  # Scales applied *before* weighting, to normalize magnitudes across metrics.
   scales:
-    gradient: 10.0
+    gradient: 1.0
     entropy: 1.0
-    eme: 0.1
+    eme: 1.0
     clipiqa: 1.0
-    musiq: 0.01
+    musiq: 1.0
+  # IQA heads used by terminal-Borda. Each head ranks the G rollouts on
+  # Δscore vs x_0; ranks are averaged across heads. Robust to single-head
+  # exploitation: a hack must beat siblings on a *majority* of heads.
+  borda_heads:
+    - clipiqa
+    - musiq
+    # niqe removed: anti-correlated with musiq (rho ~ -0.4) on diagnostic
+    # images; Borda average degenerated to noise. Keep two heads that mostly
+    # agree so rank advantage carries signal.
 
 env:
   episode_length: 5
@@ -61,12 +76,18 @@ train:
   max_grad_norm: 0.5
   normalize_advantage: true
   device: cuda
-  algorithm: ppo                # {ppo, grpo}
+  algorithm: grpo               # {ppo, grpo}; terminal_borda requires grpo
 
 grpo:
   group_size: 8
-  beta_kl: 0.0                  # optional KL-to-ref; 0 disables
+  beta_kl: 0.02                 # KL to identity policy (Goodhart bound, Gao et al. 2023)
+  init_log_sigma_ref: -0.5      # σ_ref of the identity reference policy (raw space)
   drop_critic: true
+  # If true, sibling rollouts in a group share noise spatially (one [B,3,1,1]
+  # draw broadcast across H,W), differing only by a global per-channel tone
+  # shift. Restores Borda informativeness vs per-pixel-independent noise that
+  # produces 8 indistinguishable noise fields.
+  shared_global_noise: true
 
 log:
   dir: ./runs

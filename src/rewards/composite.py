@@ -139,7 +139,10 @@ class CompositeReward:
         device: str = "cpu",
     ) -> None:
         self.mode: str = str(cfg_reward.mode)
-        assert self.mode in {"scalar", "pixel"}, f"invalid reward.mode: {self.mode}"
+        # `terminal_borda` is GRPO-only and never calls into this object; we
+        # still allow construction so the rest of the train script can wire
+        # the env up uniformly. compute() will assert if invoked in that mode.
+        assert self.mode in {"scalar", "pixel", "terminal_borda"}, f"invalid reward.mode: {self.mode}"
         self.relative: bool = bool(cfg_reward.relative)
         self.pixel_smooth_radius: int = int(cfg_reward.pixel_smooth_radius)
         self._device = device
@@ -185,6 +188,10 @@ class CompositeReward:
         Reward shape depends on `self.mode`.
         """
         assert x_curr.ndim == 4
+        assert self.mode in {"scalar", "pixel"}, (
+            f"CompositeReward.compute() called in mode={self.mode!r}; "
+            "terminal_borda must use the GRPO trainer's IQA-head path instead."
+        )
         h, w = x_curr.shape[-2:]
         per_name_values: Dict[str, float] = {}
 

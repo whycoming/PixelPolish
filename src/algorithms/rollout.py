@@ -5,14 +5,14 @@ trajectory stores raw samples (not squashed actions) so PPO can re-score them
 under the updated policy.
 """
 
-from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from torch import Tensor
 
 from src.env.image_env import ImageEnhancementEnv
-from src.models.actions import sample_action
+from src.models.actions import apply_curve, raw_to_curve_params, sample_action
 from src.models.policy_fcn import PolicyValueFCN
 
 
@@ -27,6 +27,8 @@ class Trajectory:
                   [T, B, 1, H, W] if reward.mode == 'pixel'
     values:       [T+1, B, 1, H, W]      bootstrap appended
     sub_rewards:  dict name -> [T] mean-across-batch scalars (for logging)
+    final_state:  [B, C, H, W] image after applying all T actions (x_K).
+                  Populated by both rollout modes; used for terminal-reward GRPO.
     """
 
     states: Tensor
@@ -35,6 +37,7 @@ class Trajectory:
     rewards: Tensor
     values: Tensor
     sub_rewards: Dict[str, List[float]]
+    final_state: Optional[Tensor] = None
 
 
 def collect_rollout(
@@ -87,4 +90,53 @@ def collect_rollout(
         rewards=rewards,
         values=values,
         sub_rewards=sub_rewards,
+        final_state=x_t,
+    )
+
+
+def collect_rollout_actions_only(
+    env: ImageEnhancementEnv,
+    policy: PolicyValueFCN,
+    x0: Tensor,
+    shared_global_noise: bool = False,
+) -> Trajectory:
+    """Roll out an episode without computing per-step rewards.
+
+    Avoids the per-step CompositeReward (and its IQA model calls) entirely.
+    Used by GRPO in terminal-reward mode where the reward is computed only
+    once per rollout from (x_0, x_K). Stores zero placeholders for rewards
+    and values so the Trajectory dataclass shape matches the reward-using
+    path.
+    """
+    device = x0.device
+    T = env.episode_length
+    B, C, H, W = x0.shape
+
+    states = torch.empty((T, B, C, H, W), dtype=x0.dtype, device=device)
+    raw_actions = torch.empty((T, B, 3, H, W), dtype=x0.dtype, device=device)
+    log_probs = torch.empty((T, B, 1, H, W), dtype=x0.dtype, device=device)
+
+    x_t = x0
+    policy.eval()
+    with torch.no_grad():
+        for t in range(T):
+            states[t] = x_t
+            mu, log_sigma, _ = policy(x_t)
+            gamma, alpha, beta, log_prob, raw = sample_action(
+                mu, log_sigma, env.bounds, shared_global_noise=shared_global_noise
+            )
+            raw_actions[t] = raw
+            log_probs[t] = log_prob
+            x_t = apply_curve(x_t, gamma, alpha, beta)
+
+    rewards = torch.zeros((T, B), dtype=x0.dtype, device=device)
+    values = torch.zeros((T + 1, B, 1, H, W), dtype=x0.dtype, device=device)
+    return Trajectory(
+        states=states,
+        raw_actions=raw_actions,
+        log_probs=log_probs,
+        rewards=rewards,
+        values=values,
+        sub_rewards={},
+        final_state=x_t,
     )

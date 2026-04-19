@@ -78,3 +78,29 @@ class NIQEReward(_PyIQAWrappedReward):
 
 class BRISQUEReward(_PyIQAWrappedReward):
     _metric_name = "brisque"
+
+
+_HEAD_REGISTRY = {
+    "clipiqa": CLIPIQAReward,
+    "musiq": MUSIQReward,
+    "niqe": NIQEReward,
+    "brisque": BRISQUEReward,
+}
+
+
+def build_head(name: str, device: str = "cpu") -> Optional["_PyIQAWrappedReward"]:
+    """Public factory for a single IQA head.
+
+    Returns None if `pyiqa` is missing, the name is unknown, or instantiation
+    fails (e.g., pretrained weights cannot be downloaded). Sign convention is
+    already applied in `_compute` so higher = better in all cases.
+    """
+    if _try_import_pyiqa() is None:
+        return None
+    cls = _HEAD_REGISTRY.get(name)
+    if cls is None:
+        return None
+    try:
+        return cls(device=device)
+    except Exception:
+        return None

@@ -76,6 +76,10 @@ def _ppo_config_from(cfg) -> PPOConfig:
 def _grpo_config_from(cfg) -> GRPOConfig:
     t = cfg.train
     g = cfg.grpo
+    reward_mode = str(cfg.reward.mode)
+    borda_heads: List[str] = []
+    if reward_mode == "terminal_borda":
+        borda_heads = [str(h) for h in (getattr(cfg.reward, "borda_heads", None) or [])]
     return GRPOConfig(
         group_size=int(g.group_size),
         clip_ratio=float(t.clip_ratio),
@@ -88,8 +92,27 @@ def _grpo_config_from(cfg) -> GRPOConfig:
         max_grad_norm=float(t.max_grad_norm),
         drop_critic=bool(g.drop_critic),
         beta_kl=float(g.beta_kl),
-        reward_mode=str(cfg.reward.mode),
+        init_log_sigma_ref=float(getattr(g, "init_log_sigma_ref", cfg.model.init_log_sigma)),
+        reward_mode=reward_mode,
+        borda_heads=borda_heads,
+        shared_global_noise=bool(getattr(g, "shared_global_noise", False)),
     )
+
+
+def _build_iqa_heads_for_borda(cfg, device: str):
+    """Instantiate the IQA heads named in `cfg.reward.borda_heads`. Returns
+    a dict {name: callable(x)->[B]}. Skips heads that pyiqa cannot load."""
+    from src.rewards.iqa import build_head
+    names = [str(h) for h in (getattr(cfg.reward, "borda_heads", None) or [])]
+    heads = {}
+    for name in names:
+        h = build_head(name, device=device)
+        if h is None:
+            print(f"[train] warn: borda head '{name}' unavailable, skipping.")
+            continue
+        # `_compute` returns higher-is-better [B] scores (sign already flipped).
+        heads[name] = h._compute
+    return heads
 
 
 def main() -> int:
@@ -164,7 +187,13 @@ def main() -> int:
     if algorithm == "ppo":
         ppo = PPOTrainer(policy, optimizer, _ppo_config_from(cfg))
     else:
-        grpo = GRPOTrainer(policy, optimizer, env, _grpo_config_from(cfg))
+        grpo_cfg = _grpo_config_from(cfg)
+        iqa_heads = (
+            _build_iqa_heads_for_borda(cfg, device)
+            if grpo_cfg.reward_mode == "terminal_borda"
+            else None
+        )
+        grpo = GRPOTrainer(policy, optimizer, env, grpo_cfg, iqa_heads=iqa_heads)
 
     total_updates = int(cfg.train.total_updates)
     log_interval = int(cfg.log.interval)
