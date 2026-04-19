@@ -4,12 +4,13 @@ If `pyiqa` is not installed, instantiating these classes raises a clear error;
 the factory in `composite.py` checks availability and skips gracefully.
 """
 
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 from torch import Tensor
 
 from src.rewards.base import RewardFunction
+from src.rewards.exposure import LocalExposureReward
 
 
 def _try_import_pyiqa():
@@ -88,13 +89,24 @@ _HEAD_REGISTRY = {
 }
 
 
-def build_head(name: str, device: str = "cpu") -> Optional["_PyIQAWrappedReward"]:
-    """Public factory for a single IQA head.
+def build_head(name: str, device: str = "cpu", **kwargs: Any) -> Optional[RewardFunction]:
+    """Public factory for a single IQA / anchor head used by terminal-Borda.
 
-    Returns None if `pyiqa` is missing, the name is unknown, or instantiation
-    fails (e.g., pretrained weights cannot be downloaded). Sign convention is
-    already applied in `_compute` so higher = better in all cases.
+    Returns None if the head is unavailable (pyiqa missing, unknown name,
+    failed instantiation). Sign convention applied in `_compute` so higher =
+    better in all cases. `kwargs` are forwarded to head constructors that
+    accept extra params (currently `l_exposure` -> `patch_size`, `target`).
     """
+    # Non-pyiqa heads first.
+    if name == "l_exposure":
+        try:
+            return LocalExposureReward(
+                patch_size=int(kwargs.get("patch_size", 16)),
+                target=float(kwargs.get("target", 0.6)),
+                device=device,
+            )
+        except Exception:
+            return None
     if _try_import_pyiqa() is None:
         return None
     cls = _HEAD_REGISTRY.get(name)

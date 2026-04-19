@@ -52,9 +52,26 @@ reward:
   borda_heads:
     - clipiqa
     - musiq
+    - l_exposure
     # niqe removed: anti-correlated with musiq (rho ~ -0.4) on diagnostic
-    # images; Borda average degenerated to noise. Keep two heads that mostly
+    # images; Borda average degenerated to noise. Keep heads that mostly
     # agree so rank advantage carries signal.
+    # l_exposure (Zero-DCE-style): patch-mean luma to target. Bidirectional
+    # anchor — penalises both under- and over-exposure. Always uses Δ-mode
+    # (no entry in `iqa_target_path` JSON), so Borda gets:
+    #   score = L_exp(x_0) - L_exp(x_K)   (exposure-deviation reduction)
+  # patch size for l_exposure (16×16 patches on 256×256 = 16×16 grid, Zero-DCE default).
+  exposure_patch_size: 16
+  # luma target E for l_exposure. 0.6 from Zero-DCE; lower it (e.g. 0.5) if
+  # training data is intentionally darker than natural-RGB.
+  exposure_target: 0.6
+  # Optional path to a JSON produced by `scripts/precompute_iqa_target.py`.
+  # When set, terminal-Borda scores rollouts by -((IQA(x_K) - μ)/σ)² instead
+  # of Δ-from-baseline. Anchors the policy to the natural-image IQA
+  # distribution per head (Option A target reward) — kills the "more is more"
+  # over-brightening failure mode seen with Δ-Borda. Leave null to use
+  # Δ-from-baseline scoring (legacy).
+  iqa_target_path: null
 
 env:
   episode_length: 5

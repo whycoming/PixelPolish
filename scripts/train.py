@@ -8,9 +8,10 @@ Override on 6 GB VRAM:
 """
 
 import argparse
+import json
 import sys
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from torch.optim import Adam
@@ -73,13 +74,41 @@ def _ppo_config_from(cfg) -> PPOConfig:
     )
 
 
+def _load_iqa_targets(path: Optional[str]) -> Optional[Dict[str, Tuple[float, float]]]:
+    """Load (μ, σ) per head from a precompute_iqa_target.py JSON, if provided."""
+    if not path:
+        return None
+    p = Path(path)
+    if not p.is_file():
+        print(f"[train] warn: iqa_target_path={path} not found, falling back to Δ-Borda")
+        return None
+    with open(p, "r") as f:
+        blob = json.load(f)
+    out: Dict[str, Tuple[float, float]] = {}
+    for name, stats in blob.get("heads", {}).items():
+        mu = float(stats["mu"])
+        sigma = float(stats["sigma"])
+        if sigma < 1e-6:
+            print(f"[train] warn: head '{name}' σ~0 in target file, skipping")
+            continue
+        out[name] = (mu, sigma)
+    if not out:
+        print(f"[train] warn: iqa_target file '{path}' contained no usable heads")
+        return None
+    print(f"[train] loaded IQA targets from {path}: "
+          + ", ".join(f"{k} μ={v[0]:.3f} σ={v[1]:.3f}" for k, v in out.items()))
+    return out
+
+
 def _grpo_config_from(cfg) -> GRPOConfig:
     t = cfg.train
     g = cfg.grpo
     reward_mode = str(cfg.reward.mode)
     borda_heads: List[str] = []
+    iqa_targets: Optional[Dict[str, Tuple[float, float]]] = None
     if reward_mode == "terminal_borda":
         borda_heads = [str(h) for h in (getattr(cfg.reward, "borda_heads", None) or [])]
+        iqa_targets = _load_iqa_targets(getattr(cfg.reward, "iqa_target_path", None))
     return GRPOConfig(
         group_size=int(g.group_size),
         clip_ratio=float(t.clip_ratio),
@@ -96,6 +125,7 @@ def _grpo_config_from(cfg) -> GRPOConfig:
         reward_mode=reward_mode,
         borda_heads=borda_heads,
         shared_global_noise=bool(getattr(g, "shared_global_noise", False)),
+        iqa_targets=iqa_targets,
     )
 
 
@@ -104,9 +134,15 @@ def _build_iqa_heads_for_borda(cfg, device: str):
     a dict {name: callable(x)->[B]}. Skips heads that pyiqa cannot load."""
     from src.rewards.iqa import build_head
     names = [str(h) for h in (getattr(cfg.reward, "borda_heads", None) or [])]
+    extra: Dict[str, dict] = {
+        "l_exposure": {
+            "patch_size": int(getattr(cfg.reward, "exposure_patch_size", 16)),
+            "target": float(getattr(cfg.reward, "exposure_target", 0.6)),
+        },
+    }
     heads = {}
     for name in names:
-        h = build_head(name, device=device)
+        h = build_head(name, device=device, **extra.get(name, {}))
         if h is None:
             print(f"[train] warn: borda head '{name}' unavailable, skipping.")
             continue

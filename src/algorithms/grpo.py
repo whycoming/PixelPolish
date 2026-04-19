@@ -23,7 +23,7 @@ Memory scales as B * G * T forwards per update.
 """
 
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 import math
 
@@ -59,6 +59,13 @@ class GRPOConfig:
     reward_mode: str = "scalar"  # {scalar, pixel, terminal_borda}
     borda_heads: List[str] = field(default_factory=list)
     shared_global_noise: bool = False  # if True, sibling rollouts differ only by a global tone shift (per-rollout [B,3,1,1] noise broadcast across H,W). Restores rank informativeness for IQA-Borda.
+    # Per-head (μ, σ) of natural-image IQA distribution. When set, terminal-Borda
+    # scores rollouts by negative squared z-distance from μ instead of Δ from x_0:
+    #   score_h(rollout) = -((IQA_h(x_K) - μ_h) / σ_h)²
+    # This anchors the reward to "natural-typical IQA" (Option A target reward),
+    # eliminating the "more is more" failure mode where heads with intrinsic
+    # brightness/contrast bias push already-good images further out of distribution.
+    iqa_targets: Optional[Dict[str, Tuple[float, float]]] = None
 
 
 def _trajectory_return_scalar(traj: Trajectory) -> Tensor:
@@ -160,31 +167,62 @@ class GRPOTrainer:
     def _terminal_borda_advantage(
         self, x0: Tensor, trajs: List[Trajectory]
     ) -> Dict[str, Tensor]:
-        """Compute per-head Δ-scores and Borda-rank advantage.
+        """Compute per-head scores, rank them, return centered Borda advantage.
 
-        Returns a dict with:
-            'adv':      [G, B] centered Borda advantage (used as policy advantage)
-            'returns':  [G, B] mean Δ-score across heads (for logging only)
-            'per_head_delta': dict name -> [G, B]
+        Two scoring modes:
+
+        - **Δ-from-baseline** (default, when `cfg.iqa_targets` is None):
+              score_h(rollout) = IQA_h(x_K) - IQA_h(x_0)
+          Higher is better — the rollout that improves IQA most against x_0
+          gets the top rank. Suffers from "more is more": already-good images
+          get pushed further when heads have intrinsic brightness/contrast bias.
+
+        - **Target-distribution** (Option A, when `cfg.iqa_targets` is set):
+              score_h(rollout) = -((IQA_h(x_K) - μ_h) / σ_h)²
+          Maximized at IQA(x_K) = μ_h, strictly negative either side. Anchors
+          the policy to natural-typical IQA per head, eliminating run-away
+          deviation. (μ_h, σ_h) precomputed on a high-quality reference set.
+
+        Returns:
+            'adv':            [G, B] centered Borda advantage
+            'returns':        [G, B] mean per-head score (logging)
+            'per_head_score': dict name -> [G, B] raw per-head scores (logging)
+            'per_head_delta': alias kept for backward-compat metric naming
         """
-        # Score x_0 once, x_K once per rollout.
-        head_deltas: Dict[str, Tensor] = {}
+        targets = self.cfg.iqa_targets
+        head_scores: Dict[str, Tensor] = {}
+        # Also collect raw IQA(x_K) per head for diagnostics regardless of mode.
+        head_raw_xk: Dict[str, Tensor] = {}
         with torch.no_grad():
             for name, fn in self._iqa_heads.items():
-                s0 = fn(x0)  # [B]
+                # Always compute s0 (cheap, one call) for Δ logging in either mode.
+                s0 = fn(x0)
                 if s0.ndim != 1:
                     s0 = s0.view(-1)
-                deltas = []
+                sk_list, score_list = [], []
                 for traj in trajs:
                     sk = fn(traj.final_state)
                     if sk.ndim != 1:
                         sk = sk.view(-1)
-                    deltas.append(sk - s0)
-                head_deltas[name] = torch.stack(deltas, dim=0)  # [G, B]
-        adv = _borda_rank_advantage(head_deltas)
-        # Logging: mean Δ across heads, normalized to per-head magnitude.
-        mean_delta = torch.stack(list(head_deltas.values()), dim=0).mean(dim=0)  # [G, B]
-        return {"adv": adv, "returns": mean_delta, "per_head_delta": head_deltas}
+                    sk_list.append(sk)
+                    if targets is not None and name in targets:
+                        mu, sigma = targets[name]
+                        z = (sk - float(mu)) / max(float(sigma), 1e-6)
+                        score_list.append(-(z * z))
+                    else:
+                        # Fallback: Δ-from-baseline if no target for this head.
+                        score_list.append(sk - s0)
+                head_scores[name] = torch.stack(score_list, dim=0)   # [G, B]
+                head_raw_xk[name] = torch.stack(sk_list, dim=0)      # [G, B]
+        adv = _borda_rank_advantage(head_scores)
+        mean_score = torch.stack(list(head_scores.values()), dim=0).mean(dim=0)  # [G, B]
+        return {
+            "adv": adv,
+            "returns": mean_score,
+            "per_head_score": head_scores,
+            "per_head_delta": head_scores,  # back-compat alias for metric loop
+            "per_head_xk": head_raw_xk,
+        }
 
     def update(self, x0: Tensor) -> Dict[str, float]:
         """Collect G rollouts from `x0` and perform PPO-style update using group advantage."""
@@ -240,8 +278,11 @@ class GRPOTrainer:
             "grpo/return_std": float(returns_g.std()),
         }
         if cfg.reward_mode == "terminal_borda":
-            for name, delta in borda["per_head_delta"].items():
-                metrics[f"borda/delta_{name}"] = float(delta.mean())
+            for name, score in borda["per_head_score"].items():
+                metrics[f"borda/score_{name}"] = float(score.mean())
+            for name, xk in borda.get("per_head_xk", {}).items():
+                metrics[f"borda/xk_{name}_mean"] = float(xk.mean())
+                metrics[f"borda/xk_{name}_std"] = float(xk.std())
         n = 0
         for _ in range(cfg.ppo_epochs):
             perm = torch.randperm(N, device=device)

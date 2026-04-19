@@ -142,5 +142,96 @@ def test_grpo_terminal_borda_smoke() -> None:
     assert "loss/total" in metrics
     assert "loss/kl_ref" in metrics
     assert metrics["loss/kl_ref"] >= 0.0
-    assert "borda/delta_fake_a" in metrics
-    assert "borda/delta_fake_b" in metrics
+    assert "borda/score_fake_a" in metrics
+    assert "borda/score_fake_b" in metrics
+    # In Δ-mode (no iqa_targets), per-head xK diagnostics should also be logged.
+    assert "borda/xk_fake_a_mean" in metrics
+    assert "borda/xk_fake_b_mean" in metrics
+
+
+def test_grpo_terminal_borda_target_mode_smoke() -> None:
+    """Target-distribution mode: scores = -((s_K - μ)/σ)²; Borda still works."""
+    torch.manual_seed(0)
+    policy = PolicyValueFCN(in_channels=3, base_filters=8, num_dilated_blocks=1,
+                            init_log_sigma=-0.5)
+    optimizer = torch.optim.Adam(policy.parameters(), lr=1e-3)
+    bounds = ActionBounds(gamma=(0.5, 2.0), alpha=(0.5, 2.0), beta=(-0.1, 0.1),
+                          gamma_log=True, alpha_log=True)
+    env = ImageEnhancementEnv(reward_fn=_ConstReward(), bounds=bounds, episode_length=3)
+    cfg = GRPOConfig(
+        group_size=4,
+        ppo_epochs=1,
+        minibatch_size=2,
+        drop_critic=True,
+        beta_kl=0.05,
+        init_log_sigma_ref=-0.5,
+        reward_mode="terminal_borda",
+        borda_heads=["fake_a", "fake_b"],
+        iqa_targets={"fake_a": (0.5, 0.1), "fake_b": (0.4, 0.05)},
+    )
+    iqa_heads = {
+        "fake_a": lambda x: x.mean(dim=(1, 2, 3)),
+        "fake_b": lambda x: x.std(dim=(1, 2, 3)),
+    }
+    trainer = GRPOTrainer(policy, optimizer, env, cfg, iqa_heads=iqa_heads)
+    x0 = torch.rand(2, 3, 16, 16)
+    metrics = trainer.update(x0)
+    # Scores are -(z²), so always <= 0.
+    assert metrics["borda/score_fake_a"] <= 0.0
+    assert metrics["borda/score_fake_b"] <= 0.0
+
+
+def test_local_exposure_score_at_target_is_max() -> None:
+    """Constant-luma image at E=0.6 must score 0; off-target must be negative."""
+    from src.rewards.exposure import LocalExposureReward
+    head = LocalExposureReward(patch_size=4, target=0.6)
+    x_at = torch.full((2, 3, 16, 16), 0.6)
+    x_off = torch.full((2, 3, 16, 16), 0.1)
+    s_at = head._compute(x_at)
+    s_off = head._compute(x_off)
+    assert s_at.shape == (2,)
+    assert torch.allclose(s_at, torch.zeros(2), atol=1e-5), f"at-target score {s_at}"
+    assert torch.all(s_off < s_at), f"off-target {s_off} should be < at-target {s_at}"
+    # Symmetry: 0.1 below and 0.1 above target should score equally.
+    x_above = torch.full((2, 3, 16, 16), 0.7)
+    x_below = torch.full((2, 3, 16, 16), 0.5)
+    assert torch.allclose(head._compute(x_above), head._compute(x_below), atol=1e-5)
+
+
+def test_grpo_terminal_borda_mixed_target_and_delta_modes() -> None:
+    """3 heads: clipiqa/musiq fakes use target-mode, l_exposure uses Δ-mode."""
+    torch.manual_seed(0)
+    from src.rewards.exposure import LocalExposureReward
+    policy = PolicyValueFCN(in_channels=3, base_filters=8, num_dilated_blocks=1,
+                            init_log_sigma=-0.5)
+    optimizer = torch.optim.Adam(policy.parameters(), lr=1e-3)
+    bounds = ActionBounds(gamma=(0.5, 2.0), alpha=(0.5, 2.0), beta=(-0.1, 0.1),
+                          gamma_log=True, alpha_log=True)
+    env = ImageEnhancementEnv(reward_fn=_ConstReward(), bounds=bounds, episode_length=3)
+    cfg = GRPOConfig(
+        group_size=4,
+        ppo_epochs=1,
+        minibatch_size=2,
+        drop_critic=True,
+        beta_kl=0.05,
+        init_log_sigma_ref=-0.5,
+        reward_mode="terminal_borda",
+        borda_heads=["fake_a", "fake_b", "l_exposure"],
+        # Only the two fake heads have targets; l_exposure falls through to Δ-mode.
+        iqa_targets={"fake_a": (0.5, 0.1), "fake_b": (0.4, 0.05)},
+    )
+    exp_head = LocalExposureReward(patch_size=4, target=0.6)
+    iqa_heads = {
+        "fake_a": lambda x: x.mean(dim=(1, 2, 3)),
+        "fake_b": lambda x: x.std(dim=(1, 2, 3)),
+        "l_exposure": exp_head._compute,
+    }
+    trainer = GRPOTrainer(policy, optimizer, env, cfg, iqa_heads=iqa_heads)
+    x0 = torch.rand(2, 3, 16, 16)
+    metrics = trainer.update(x0)
+    assert metrics["borda/score_fake_a"] <= 0.0      # target-mode (always ≤0)
+    assert metrics["borda/score_fake_b"] <= 0.0      # target-mode (always ≤0)
+    assert "borda/score_l_exposure" in metrics       # Δ-mode (sign unconstrained)
+    assert "borda/xk_l_exposure_mean" in metrics
+    # KL still tracked when 3 heads are active.
+    assert metrics["loss/kl_ref"] >= 0.0
