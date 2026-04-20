@@ -8,12 +8,13 @@ Override on 6 GB VRAM:
 """
 
 import argparse
+import json
 import sys
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
-from torch.optim import Adam
+from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -73,9 +74,43 @@ def _ppo_config_from(cfg) -> PPOConfig:
     )
 
 
+def _load_iqa_targets(path: Optional[str]) -> Optional[Dict[str, Tuple[float, float]]]:
+    """Load (μ, σ) per head from a precompute_iqa_target.py JSON, if provided."""
+    if not path:
+        return None
+    p = Path(path)
+    if not p.is_file():
+        print(f"[train] warn: iqa_target_path={path} not found, falling back to Δ-Borda")
+        return None
+    with open(p, "r") as f:
+        blob = json.load(f)
+    out: Dict[str, Tuple[float, float]] = {}
+    for name, stats in blob.get("heads", {}).items():
+        mu = float(stats["mu"])
+        sigma = float(stats["sigma"])
+        if sigma < 1e-6:
+            print(f"[train] warn: head '{name}' σ~0 in target file, skipping")
+            continue
+        out[name] = (mu, sigma)
+    if not out:
+        print(f"[train] warn: iqa_target file '{path}' contained no usable heads")
+        return None
+    print(f"[train] loaded IQA targets from {path}: "
+          + ", ".join(f"{k} μ={v[0]:.3f} σ={v[1]:.3f}" for k, v in out.items()))
+    return out
+
+
 def _grpo_config_from(cfg) -> GRPOConfig:
     t = cfg.train
     g = cfg.grpo
+    reward_mode = str(cfg.reward.mode)
+    borda_heads: List[str] = []
+    iqa_targets: Optional[Dict[str, Tuple[float, float]]] = None
+    state_aug_iqa: List[str] = []
+    if reward_mode == "terminal_borda":
+        borda_heads = [str(h) for h in (getattr(cfg.reward, "borda_heads", None) or [])]
+        iqa_targets = _load_iqa_targets(getattr(cfg.reward, "iqa_target_path", None))
+        state_aug_iqa = [str(h) for h in (getattr(g, "state_aug_iqa", None) or [])]
     return GRPOConfig(
         group_size=int(g.group_size),
         clip_ratio=float(t.clip_ratio),
@@ -88,8 +123,36 @@ def _grpo_config_from(cfg) -> GRPOConfig:
         max_grad_norm=float(t.max_grad_norm),
         drop_critic=bool(g.drop_critic),
         beta_kl=float(g.beta_kl),
-        reward_mode=str(cfg.reward.mode),
+        init_log_sigma_ref=float(getattr(g, "init_log_sigma_ref", cfg.model.init_log_sigma)),
+        reward_mode=reward_mode,
+        borda_heads=borda_heads,
+        shared_global_noise=bool(getattr(g, "shared_global_noise", False)),
+        iqa_targets=iqa_targets,
+        state_aug_iqa=state_aug_iqa,
     )
+
+
+def _build_iqa_heads_for_borda(cfg, device: str):
+    """Instantiate the IQA heads named in `cfg.reward.borda_heads`. Returns
+    a dict {name: callable(x_0, x_K)->[B]} with unified binary signature.
+    Unary heads (clipiqa, musiq, l_exposure, gray_world) ignore x_0."""
+    from src.rewards.iqa import build_head, as_binary_score
+    names = [str(h) for h in (getattr(cfg.reward, "borda_heads", None) or [])]
+    extra: Dict[str, dict] = {
+        "l_exposure": {
+            "patch_size": int(getattr(cfg.reward, "exposure_patch_size", 16)),
+            "target": float(getattr(cfg.reward, "exposure_target", 0.6)),
+        },
+        "lpips": {"net": str(getattr(cfg.reward, "lpips_net", "vgg"))},
+    }
+    heads = {}
+    for name in names:
+        h = build_head(name, device=device, **extra.get(name, {}))
+        if h is None:
+            print(f"[train] warn: borda head '{name}' unavailable, skipping.")
+            continue
+        heads[name] = as_binary_score(h)
+    return heads
 
 
 def main() -> int:
@@ -127,13 +190,27 @@ def main() -> int:
     data_iter = _infinite_loader(loader)
 
     # --- Model / optimizer ---
+    # Auto-size in_channels when GRPO state augmentation is on: each entry in
+    # grpo.state_aug_iqa adds one broadcast channel to the policy input.
+    base_in = int(cfg.model.in_channels)
+    algorithm_name = str(cfg.train.algorithm).lower()
+    extra_in = 0
+    if algorithm_name == "grpo" and str(cfg.reward.mode) == "terminal_borda":
+        extra_in = len([h for h in (getattr(cfg.grpo, "state_aug_iqa", None) or [])])
     policy = PolicyValueFCN(
-        in_channels=cfg.model.in_channels,
+        in_channels=base_in + extra_in,
         base_filters=cfg.model.base_filters,
         num_dilated_blocks=cfg.model.num_dilated_blocks,
         init_log_sigma=cfg.model.init_log_sigma,
     ).to(device)
-    optimizer = Adam(policy.parameters(), lr=float(cfg.train.lr))
+    if extra_in:
+        print(f"[train] policy in_channels = {base_in} + {extra_in} "
+              f"(state_aug_iqa={list(cfg.grpo.state_aug_iqa)})")
+    optimizer = AdamW(
+        policy.parameters(),
+        lr=float(cfg.train.lr),
+        weight_decay=float(getattr(cfg.train, "weight_decay", 0.01)),
+    )
 
     # --- Reward / env ---
     reward_fn = CompositeReward(cfg.reward, device=device).to(device)
@@ -164,7 +241,13 @@ def main() -> int:
     if algorithm == "ppo":
         ppo = PPOTrainer(policy, optimizer, _ppo_config_from(cfg))
     else:
-        grpo = GRPOTrainer(policy, optimizer, env, _grpo_config_from(cfg))
+        grpo_cfg = _grpo_config_from(cfg)
+        iqa_heads = (
+            _build_iqa_heads_for_borda(cfg, device)
+            if grpo_cfg.reward_mode == "terminal_borda"
+            else None
+        )
+        grpo = GRPOTrainer(policy, optimizer, env, grpo_cfg, iqa_heads=iqa_heads)
 
     total_updates = int(cfg.train.total_updates)
     log_interval = int(cfg.log.interval)

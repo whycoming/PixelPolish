@@ -1,0 +1,30 @@
+# v6 local overrides: solution A (input-anchored Borda) + B (state aug),
+# sized for a 6 GB VRAM laptop running on the 64-image DICM subset.
+data:
+  image_size: 128
+  num_workers: 0          # Windows multiprocessing footgun
+
+model:
+  base_filters: 32
+  # in_channels is auto-grown from 3 + len(grpo.state_aug_iqa) in scripts/train.py
+
+train:
+  batch_size: 1
+  minibatch_size: 1
+  total_updates: 100
+  device: cuda
+
+grpo:
+  group_size: 4           # 4 rollouts / image fits on 6GB at 128²
+  state_aug_iqa:
+    - clipiqa
+    - musiq
+
+log:
+  interval: 5
+  image_interval: 0       # terminal_borda path in train.py only logs images for ppo
+  num_log_images: 2
+
+checkpoint:
+  interval: 50
+  keep_last: 1

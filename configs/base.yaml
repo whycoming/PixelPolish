@@ -15,31 +15,61 @@ model:
   init_log_sigma: -0.5
 
 action:
-  gamma_range: [0.3, 3.0]
-  alpha_range: [0.5, 2.0]
-  beta_range: [-0.2, 0.2]
+  # Log-symmetric ranges centered at the multiplicative identity (γ=1, α=1).
+  # With log_param=true, raw=0 -> deterministic identity, giving a clean
+  # residual-to-identity initialization (combined with zero-init policy heads).
+  gamma_range: [0.5, 2.0]
+  alpha_range: [0.7071067811865476, 1.4142135623730951]   # 1/√2, √2
+  beta_range: [-0.1, 0.1]
+  gamma_log_param: true
+  alpha_log_param: true
 
 reward:
-  # Whether rewards are reduced to a scalar per image (Phase 3) or kept per-pixel (Phase 4).
-  mode: scalar         # {scalar, pixel}
-  # Spatial smoothing kernel radius applied to per-pixel reward maps (Phase 4). 0 disables.
-  pixel_smooth_radius: 2
-  # Relative reward: r_t = R(x_curr) - R(x_prev). Always on.
-  relative: true
-  # Sub-reward weights. Zero to disable.
+  # `terminal_borda`: reward only at episode end via per-head rank aggregation
+  # over `borda_heads`. The legacy CompositeReward is still constructed (with
+  # the dummy weight below) but is not called during GRPO terminal-borda
+  # rollouts.
+  mode: terminal_borda
+  pixel_smooth_radius: 0
+  relative: false
+  # Dummy non-zero weight so CompositeReward can instantiate; never invoked
+  # in terminal_borda + GRPO mode. Set physics weights to 0 elsewhere.
   weights:
     gradient: 1.0
-    entropy: 0.5
-    eme: 0.5
-    clipiqa: 1.0       # 0 if pyiqa not installed; training will warn and skip.
+    entropy: 0.0
+    eme: 0.0
+    clipiqa: 0.0
     musiq: 0.0
-  # Scales applied *before* weighting, to normalize magnitudes across metrics.
   scales:
-    gradient: 10.0
+    gradient: 1.0
     entropy: 1.0
-    eme: 0.1
+    eme: 1.0
     clipiqa: 1.0
-    musiq: 0.01
+    musiq: 1.0
+  # IQA heads used by terminal-Borda. v6 mixes two unary IQA heads
+  # (clipiqa, musiq — coarse proxies) with three **input-anchored** heads
+  # that are bounded ≤ 0 and maximised at x_K = x_0:
+  #   identity_l1 : -mean |x_K - x_0|
+  #   lpips       : -LPIPS(x_K, x_0)   (VGG16, frozen)
+  #   gray_world  : Zero-DCE L_color on x_K (unary but bounded)
+  # Theory: Gao et al. 2023's scaling-law bound requires the reward to be
+  # bounded and input-anchored — otherwise the policy learns to regress to
+  # the training-distribution mean (the v4/v5 failure mode).
+  borda_heads:
+    - clipiqa
+    - musiq
+    - identity_l1
+    - lpips
+    - gray_world
+  # LPIPS backbone (vgg|alex|squeeze). vgg is the Zhang-et-al default.
+  lpips_net: vgg
+  # Optional path to a JSON produced by `scripts/precompute_iqa_target.py`.
+  # When set, terminal-Borda scores rollouts by -((IQA(x_K) - μ)/σ)² instead
+  # of Δ-from-baseline. Anchors the policy to the natural-image IQA
+  # distribution per head (Option A target reward) — kills the "more is more"
+  # over-brightening failure mode seen with Δ-Borda. Leave null to use
+  # Δ-from-baseline scoring (legacy).
+  iqa_target_path: null
 
 env:
   episode_length: 5
@@ -61,12 +91,25 @@ train:
   max_grad_norm: 0.5
   normalize_advantage: true
   device: cuda
-  algorithm: ppo                # {ppo, grpo}
+  algorithm: grpo               # {ppo, grpo}; terminal_borda requires grpo
 
 grpo:
   group_size: 8
-  beta_kl: 0.0                  # optional KL-to-ref; 0 disables
+  beta_kl: 0.02                 # KL to identity policy (Goodhart bound, Gao et al. 2023)
+  init_log_sigma_ref: -0.5      # σ_ref of the identity reference policy (raw space)
   drop_critic: true
+  # If true, sibling rollouts in a group share noise spatially (one [B,3,1,1]
+  # draw broadcast across H,W), differing only by a global per-channel tone
+  # shift. Restores Borda informativeness vs per-pixel-independent noise that
+  # produces 8 indistinguishable noise fields.
+  shared_global_noise: true
+  # v6 state augmentation: prepend IQA(x_0) broadcast channels to the policy
+  # input so actions can condition on *current quality*. Each name must be a
+  # key in the Borda heads dict. Values are normalised to ~[0,1] (musiq /= 100).
+  # Policy in_channels auto-grows to 3 + len(state_aug_iqa).
+  state_aug_iqa:
+    - clipiqa
+    - musiq
 
 log:
   dir: ./runs

@@ -4,12 +4,14 @@ If `pyiqa` is not installed, instantiating these classes raises a clear error;
 the factory in `composite.py` checks availability and skips gracefully.
 """
 
-from typing import Optional
+from typing import Any, Callable, Optional
 
 import torch
 from torch import Tensor
 
 from src.rewards.base import RewardFunction
+from src.rewards.exposure import LocalExposureReward
+from src.rewards.borda_heads import GrayWorldHead, IdentityL1Head, LPIPSHead
 
 
 def _try_import_pyiqa():
@@ -78,3 +80,73 @@ class NIQEReward(_PyIQAWrappedReward):
 
 class BRISQUEReward(_PyIQAWrappedReward):
     _metric_name = "brisque"
+
+
+_HEAD_REGISTRY = {
+    "clipiqa": CLIPIQAReward,
+    "musiq": MUSIQReward,
+    "niqe": NIQEReward,
+    "brisque": BRISQUEReward,
+}
+
+
+def build_head(name: str, device: str = "cpu", **kwargs: Any) -> Optional[RewardFunction]:
+    """Public factory for a single IQA / anchor head used by terminal-Borda.
+
+    Returns None if the head is unavailable (pyiqa missing, unknown name,
+    failed instantiation). Sign convention applied in `_compute` so higher =
+    better in all cases. `kwargs` are forwarded to head constructors that
+    accept extra params (currently `l_exposure` -> `patch_size`, `target`).
+    """
+    # Non-pyiqa heads first.
+    if name == "l_exposure":
+        try:
+            return LocalExposureReward(
+                patch_size=int(kwargs.get("patch_size", 16)),
+                target=float(kwargs.get("target", 0.6)),
+                device=device,
+            )
+        except Exception:
+            return None
+    if name == "identity_l1":
+        return IdentityL1Head(device=device)
+    if name == "gray_world":
+        return GrayWorldHead(device=device)
+    if name == "lpips":
+        try:
+            return LPIPSHead(net=str(kwargs.get("net", "vgg")), device=device)
+        except Exception as e:
+            print(f"[build_head] lpips unavailable: {e}")
+            return None
+    if _try_import_pyiqa() is None:
+        return None
+    cls = _HEAD_REGISTRY.get(name)
+    if cls is None:
+        return None
+    try:
+        return cls(device=device)
+    except Exception:
+        return None
+
+
+def as_binary_score(head: RewardFunction) -> Callable[[Tensor, Tensor], Tensor]:
+    """Adapt any RewardFunction to a `fn(x_0, x_K) -> [B]` callable.
+
+    Unary heads (clipiqa, musiq, l_exposure, gray_world) ignore x_0 and score
+    x_K. Binary heads (identity_l1, lpips) accept the two-arg signature
+    directly. A single call signature simplifies the trainer: the same dict
+    can hold all Borda heads, and state-augmentation can extract raw x_0
+    scores via `fn(x_0, x_0)`.
+    """
+    import inspect
+    sig = inspect.signature(head._compute)
+    params = list(sig.parameters.values())
+    # Binary heads have 2 tensor params (x_0, x_K) after self.
+    if len(params) >= 2:
+        def binary(x_0: Tensor, x_K: Tensor) -> Tensor:
+            return head._compute(x_0, x_K)
+        return binary
+    def unary(x_0: Tensor, x_K: Tensor) -> Tensor:
+        del x_0  # unused
+        return head._compute(x_K)
+    return unary

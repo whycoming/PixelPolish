@@ -22,11 +22,19 @@ from torch import Tensor
 
 @dataclass(frozen=True)
 class ActionBounds:
-    """Closed intervals for gamma, alpha, beta."""
+    """Closed intervals for gamma, alpha, beta.
+
+    `gamma_log` / `alpha_log` switch the parameterization to log-uniform within
+    the given (lo, hi). With log_uniform = True and a log-symmetric range
+    (e.g. [1/k, k]), raw=0 maps to the multiplicative identity (γ=1 or α=1),
+    giving the policy a clean residual-to-identity initialization.
+    """
 
     gamma: Tuple[float, float]
     alpha: Tuple[float, float]
     beta: Tuple[float, float]
+    gamma_log: bool = False
+    alpha_log: bool = False
 
     @staticmethod
     def from_config(action_cfg) -> "ActionBounds":
@@ -34,11 +42,16 @@ class ActionBounds:
             gamma=tuple(action_cfg.gamma_range),
             alpha=tuple(action_cfg.alpha_range),
             beta=tuple(action_cfg.beta_range),
+            gamma_log=bool(getattr(action_cfg, "gamma_log_param", False)),
+            alpha_log=bool(getattr(action_cfg, "alpha_log_param", False)),
         )
 
 
-def _affine_from_tanh(t: Tensor, lo: float, hi: float) -> Tensor:
-    """Map t in (-1, 1) to (lo, hi)."""
+def _affine_from_tanh(t: Tensor, lo: float, hi: float, log_uniform: bool = False) -> Tensor:
+    """Map t in (-1, 1) to (lo, hi). If `log_uniform`, uniform in log-space."""
+    if log_uniform:
+        log_lo, log_hi = math.log(lo), math.log(hi)
+        return torch.exp(log_lo + (log_hi - log_lo) * 0.5 * (t + 1.0))
     return lo + (hi - lo) * 0.5 * (t + 1.0)
 
 
@@ -51,8 +64,8 @@ def raw_to_curve_params(
     """
     assert raw.ndim == 4 and raw.shape[1] == 3, f"expected [B,3,H,W], got {tuple(raw.shape)}"
     t = torch.tanh(raw)
-    gamma = _affine_from_tanh(t[:, 0:1], *bounds.gamma)
-    alpha = _affine_from_tanh(t[:, 1:2], *bounds.alpha)
+    gamma = _affine_from_tanh(t[:, 0:1], *bounds.gamma, log_uniform=bounds.gamma_log)
+    alpha = _affine_from_tanh(t[:, 1:2], *bounds.alpha, log_uniform=bounds.alpha_log)
     beta = _affine_from_tanh(t[:, 2:3], *bounds.beta)
     return gamma, alpha, beta
 
@@ -69,9 +82,17 @@ def _log_prob_raw(raw_sample: Tensor, mu: Tensor, log_sigma: Tensor) -> Tensor:
 
 
 def sample_action(
-    mu: Tensor, log_sigma: Tensor, bounds: ActionBounds
+    mu: Tensor, log_sigma: Tensor, bounds: ActionBounds,
+    shared_global_noise: bool = False,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Sample action, return (gamma, alpha, beta, log_prob, raw_sample).
+
+    If `shared_global_noise=True`, draw one [B,3,1,1] noise per sample and
+    broadcast spatially: each rollout differs only by a global per-channel
+    tone shift over the per-pixel μ. Sibling rollouts then look like
+    distinct global tonings of the same image — IQA heads can rank them
+    informatively, instead of seeing 8 independent high-frequency noise
+    fields all penalized equally.
 
     gamma/alpha/beta are `[B, 1, H, W]`.
     log_prob is `[B, 1, H, W]` (summed over the 3 action channels).
@@ -80,7 +101,12 @@ def sample_action(
     assert mu.shape == log_sigma.shape, f"mu {mu.shape} vs log_sigma {log_sigma.shape}"
     assert mu.ndim == 4 and mu.shape[1] == 3
     sigma = log_sigma.exp()
-    eps = torch.randn_like(mu)
+    if shared_global_noise:
+        B, C = mu.shape[0], mu.shape[1]
+        eps_g = torch.randn((B, C, 1, 1), device=mu.device, dtype=mu.dtype)
+        eps = eps_g.expand_as(mu)
+    else:
+        eps = torch.randn_like(mu)
     raw_sample = mu + sigma * eps
     log_prob = _log_prob_raw(raw_sample, mu, log_sigma)
     gamma, alpha, beta = raw_to_curve_params(raw_sample, bounds)
