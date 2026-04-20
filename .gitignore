@@ -7,7 +7,8 @@ __pycache__/
 venv/
 .env
 
-data/
+/data/
+!src/data/
 datasets/
 checkpoints/
 runs/
